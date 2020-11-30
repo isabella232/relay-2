@@ -75,6 +75,7 @@ impl ResponseError for ForwardedUpstreamRequestError {
                 HttpError::ActixPayload(e) => e.error_response(),
                 HttpError::ActixJson(e) => e.error_response(),
             },
+            UpstreamRequestError::SendFailed(_) => HttpResponse::GatewayTimeout().finish(),
             e => {
                 // should all be unreachable
                 log::error!(
