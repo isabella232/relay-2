@@ -4,15 +4,44 @@
 
 **Features**:
 
-- Relay is now able to ingest pre-aggregated sessions, which will make it possible to efficiently handle applications that produce thousands of sessions per second. ([#815](https://github.com/getsentry/relay/pull/815))
-- Add protocol support for WASM. ([#852](https://github.com/getsentry/relay/pull/852))
-- Add dynamic sampling for transactions. ([#835](https://github.com/getsentry/relay/pull/835))
+- Support dynamic sampling for error events. ([#883](https://github.com/getsentry/relay/pull/883))
+
 
 **Bug Fixes**:
 
+- Make all fields but event-id optional to fix regressions in user feedback ingestion. ([#886](https://github.com/getsentry/relay/pull/886))
+- Remove `kafka-ssl` feature because it breaks development workflow on macOS. ([#889](https://github.com/getsentry/relay/pull/889))
+- Accept envelopes where their last item is empty and trailing newlines are omitted. This also fixes a panic in some cases. ([#894](https://github.com/getsentry/relay/pull/894))
+
+**Internal**:
+
+- Extract crashpad annotations into contexts. ([#892](https://github.com/getsentry/relay/pull/892))
+- Normalize user reports during ingestion and create empty fields. ([#903](https://github.com/getsentry/relay/pull/903))
+
+## 20.12.1
+
+- No documented changes.
+
+## 20.12.0
+
+**Features**:
+
+- Add `kafka-ssl` compilation feature that builds Kafka linked against OpenSSL. This feature is enabled in Docker containers only. This is only relevant for Relays running as part of on-premise Sentry. ([#881](https://github.com/getsentry/relay/pull/881))
+- Relay is now able to ingest pre-aggregated sessions, which will make it possible to efficiently handle applications that produce thousands of sessions per second. ([#815](https://github.com/getsentry/relay/pull/815))
+- Add protocol support for WASM. ([#852](https://github.com/getsentry/relay/pull/852))
+- Add dynamic sampling for transactions. ([#835](https://github.com/getsentry/relay/pull/835))
+- Send network outage metric on healthcheck endpoint hit. ([#856](https://github.com/getsentry/relay/pull/856))
+
+**Bug Fixes**:
+
+- Fix a long-standing bug where log messages were not addressible as `$string`. ([#882](https://github.com/getsentry/relay/pull/882))
 - Allow params in content-type for security requests to support content types like `"application/expect-ct-report+json; charset=utf-8"`. ([#844](https://github.com/getsentry/relay/pull/844))
 - Fix a panic in CSP filters. ([#848](https://github.com/getsentry/relay/pull/848))
 - Do not drop sessions due to an invalid age constraint set to `0`. ([#855](https://github.com/getsentry/relay/pull/855))
+- Do not emit outcomes after forwarding envelopes to the upstream, even if that envelope is rate limited, rejected, or dropped. Since the upstream logs an outcome, it would be a duplicate. ([#857](https://github.com/getsentry/relay/pull/857))
+- Fix status code for security report. ([#864](https://github.com/getsentry/relay/pull/864))
+- Add missing fields for Expect-CT reports. ([#865](https://github.com/getsentry/relay/pull/865))
+- Support more directives in CSP reports, such as `block-all-mixed-content` and `require-trusted-types-for`. ([#876](https://github.com/getsentry/relay/pull/876))
 
 **Internal**:
 
@@ -22,6 +51,7 @@
 - Emit metrics for outcomes in external relays. ([#851](https://github.com/getsentry/relay/pull/851))
 - Make `$error.value` `pii=true`. ([#837](https://github.com/getsentry/relay/pull/837))
 - Send `key_id` in partial project config. ([#854](https://github.com/getsentry/relay/pull/854))
+- Add stack traces to Sentry error reports. ([#872](https://github.com/getsentry/relay/pull/872))
 
 ## 20.11.1
 

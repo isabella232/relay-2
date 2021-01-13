@@ -20,7 +20,6 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::fmt;
-use std::io;
 use std::str;
 use std::sync::Arc;
 use std::time::Instant;
@@ -28,9 +27,7 @@ use std::time::Instant;
 use ::actix::fut;
 use ::actix::prelude::*;
 use actix_web::client::{ClientRequest, SendRequestError};
-use actix_web::error::{JsonPayloadError, PayloadError};
 use actix_web::http::{header, Method, StatusCode};
-use actix_web::Error as ActixError;
 use failure::Fail;
 use futures::{future, prelude::*, sync::oneshot};
 use itertools::Itertools;
@@ -38,8 +35,9 @@ use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
 
 use relay_auth::{RegisterChallenge, RegisterRequest, RegisterResponse, Registration};
-use relay_common::{metric, tryf, LogError, RetryBackoff};
+use relay_common::{metric, tryf, RetryBackoff};
 use relay_config::{Config, HttpClient, RelayMode};
+use relay_log::LogError;
 use relay_quotas::{
     DataCategories, QuotaScope, RateLimit, RateLimitScope, RateLimits, RetryAfter, Scoping,
 };
@@ -49,12 +47,20 @@ use crate::metrics::{RelayHistograms, RelayTimers};
 use crate::utils::{self, ApiErrorResponse, IntoTracked, RelayErrorAction, TrackedFutureFinished};
 
 #[derive(Fail, Debug)]
+pub enum UpstreamSendRequestError {
+    #[fail(display = "could not send request using reqwest")]
+    Reqwest(#[cause] reqwest::Error),
+    #[fail(display = "could not send request using actix-web client")]
+    Actix(#[cause] SendRequestError),
+}
+
+#[derive(Fail, Debug)]
 pub enum UpstreamRequestError {
     #[fail(display = "attempted to send upstream request without credentials configured")]
     NoCredentials,
 
     #[fail(display = "could not send request to upstream")]
-    SendFailed(#[cause] SendRequestError),
+    SendFailed(#[cause] UpstreamSendRequestError),
 
     #[fail(display = "could not send request")]
     Http(#[cause] HttpError),
@@ -69,58 +75,20 @@ pub enum UpstreamRequestError {
     ChannelClosed,
 }
 
-impl From<HttpError> for UpstreamRequestError {
-    fn from(e: HttpError) -> Self {
-        UpstreamRequestError::Http(e)
-    }
-}
-
-impl From<PayloadError> for UpstreamRequestError {
-    fn from(e: PayloadError) -> Self {
-        UpstreamRequestError::Http(e.into())
-    }
-}
-
-impl From<ActixError> for UpstreamRequestError {
-    fn from(e: ActixError) -> Self {
-        UpstreamRequestError::Http(e.into())
-    }
-}
-
-impl From<reqwest::Error> for UpstreamRequestError {
-    fn from(e: reqwest::Error) -> Self {
-        UpstreamRequestError::Http(e.into())
-    }
-}
-
-impl From<io::Error> for UpstreamRequestError {
-    fn from(e: io::Error) -> Self {
-        UpstreamRequestError::Http(e.into())
-    }
-}
-
-impl From<JsonPayloadError> for UpstreamRequestError {
-    fn from(e: JsonPayloadError) -> Self {
-        UpstreamRequestError::Http(e.into())
-    }
-}
-
 impl UpstreamRequestError {
+    /// Returns `true` if the error indicates a network downtime.
     fn is_network_error(&self) -> bool {
         match self {
             Self::SendFailed(_) => true,
             Self::ResponseError(code, _) => matches!(code.as_u16(), 502 | 503 | 504),
-            Self::Http(HttpError::ActixPayload(_)) | Self::Http(HttpError::Io(_)) => true,
-            Self::Http(HttpError::Reqwest(error)) => {
-                matches!(
-                    error.status().map(|code| code.as_u16()),
-                    Some(502) | Some(503) | Some(504)
-                ) || error.is_timeout()
-            }
+            Self::Http(http) => http.is_network_error(),
             _ => false,
         }
     }
 
+    /// Returns `true` if the upstream has permanently rejected this Relay.
+    ///
+    /// This Relay should cease communication with the upstream and may shut down.
     fn is_permanent_rejection(&self) -> bool {
         match self {
             Self::ResponseError(status_code, response) => {
@@ -128,6 +96,22 @@ impl UpstreamRequestError {
                     && response.relay_action() == RelayErrorAction::Stop
             }
             _ => false,
+        }
+    }
+
+    /// Returns `true` if the request was received by the upstream.
+    ///
+    /// Despite resulting in an error, the server has received and acknowledged the request. This
+    /// includes rate limits (status code 429), and bad payloads (4XX), but not network errors
+    /// (502-504).
+    pub fn is_received(&self) -> bool {
+        match self {
+            // Rate limits are a special case of `ResponseError(429, _)`.
+            Self::RateLimited(_) => true,
+            // Everything except network errors indicates the upstream has handled this request.
+            Self::ResponseError(_, _) | Self::Http(_) => !self.is_network_error(),
+            // Remaining kinds indicate a failure to send the request.
+            Self::NoCredentials | Self::SendFailed(_) | Self::ChannelClosed => false,
         }
     }
 }
@@ -264,7 +248,7 @@ pub trait RequestBuilderTransformer: 'static + Send {
 
 impl RequestBuilderTransformer for () {
     fn build_request(&mut self, builder: RequestBuilder) -> Result<Request, UpstreamRequestError> {
-        builder.finish().map_err(UpstreamRequestError::from)
+        builder.finish().map_err(UpstreamRequestError::Http)
     }
 }
 
@@ -352,19 +336,20 @@ pub struct UpstreamRelay {
 /// Handles a response returned from the upstream.
 ///
 /// If the response indicates success via 2XX status codes, `Ok(response)` is returned. Otherwise,
-/// the response is consumed and an error is returned. Depending on the status code and details
-/// provided in the payload, one of the following errors can be returned:
+/// the response is consumed and an error is returned. If intercept_status_errors is set to true,
+/// depending on the status code and details provided in the payload, one
+/// of the following errors is returned:
 ///
 ///  1. `RateLimited` for a `429` status code.
 ///  2. `ResponseError` in all other cases.
 fn handle_response(
     response: Response,
-    update_rate_limits: bool,
+    intercept_status_errors: bool,
     max_response_size: usize,
 ) -> ResponseFuture<Response, UpstreamRequestError> {
     let status = response.status();
 
-    if !update_rate_limits || status.is_success() {
+    if !intercept_status_errors || status.is_success() {
         return Box::new(future::ok(response));
     }
 
@@ -504,6 +489,16 @@ impl UpstreamRelay {
     fn reset_network_error(&mut self) {
         self.first_error = None;
         self.outage_backoff.reset();
+        relay_log::debug!("Recovering from network outage.")
+    }
+
+    fn upstream_connection_check(&mut self, ctx: &mut Context<Self>) {
+        let next_backoff = self.outage_backoff.next_backoff();
+        relay_log::warn!(
+            "Network outage, scheduling another check in {:?}",
+            next_backoff
+        );
+        ctx.notify_later(CheckUpstreamConnection, next_backoff);
     }
 
     /// Records an occurrence of a network error.
@@ -520,7 +515,7 @@ impl UpstreamRelay {
         }
 
         if !self.outage_backoff.started() {
-            ctx.notify_later(CheckUpstreamConnection, self.outage_backoff.next_backoff());
+            self.upstream_connection_check(ctx);
         }
     }
 
@@ -571,7 +566,7 @@ impl UpstreamRelay {
         // we are about to send a HTTP message keep track of requests in flight
         self.num_inflight_requests += 1;
 
-        let update_rate_limits = request.config.update_rate_limits;
+        let intercept_status_errors = request.config.intercept_status_errors;
 
         request.send_start = Some(Instant::now());
 
@@ -583,6 +578,7 @@ impl UpstreamRelay {
                     .conn_timeout(self.config.http_connection_timeout())
                     // This is the timeout after wait + connect.
                     .timeout(self.config.http_timeout())
+                    .map_err(UpstreamSendRequestError::Actix)
                     .map_err(UpstreamRequestError::SendFailed)
                     .map(Response::Actix);
 
@@ -601,7 +597,8 @@ impl UpstreamRelay {
                     let res = client
                         .execute(client_request)
                         .await
-                        .map_err(UpstreamRequestError::from);
+                        .map_err(UpstreamSendRequestError::Reqwest)
+                        .map_err(UpstreamRequestError::SendFailed);
                     tx.send(res)
                 });
 
@@ -619,7 +616,7 @@ impl UpstreamRelay {
         future
             .track(ctx.address().recipient())
             .and_then(move |response| {
-                handle_response(response, update_rate_limits, max_response_size)
+                handle_response(response, intercept_status_errors, max_response_size)
             })
             .into_actor(self)
             .then(|send_result, slf, ctx| {
@@ -663,7 +660,7 @@ impl UpstreamRelay {
             | Err(UpstreamRequestError::Http(HttpError::Overflow))
             | Err(UpstreamRequestError::Http(HttpError::Actix(_))) => {
                 // these are not errors caused when sending to upstream so we don't need to log anything
-                log::error!("meter_result called for unsupported error");
+                relay_log::error!("meter_result called for unsupported error");
                 return;
             }
         };
@@ -789,7 +786,7 @@ impl UpstreamRelay {
         let config = UpstreamRequestConfig {
             retry: Q::retry(),
             priority: Q::priority(),
-            update_rate_limits: true,
+            intercept_status_errors: true,
             set_relay_id: true,
         };
 
@@ -830,7 +827,7 @@ impl Actor for UpstreamRelay {
     type Context = Context<Self>;
 
     fn started(&mut self, context: &mut Self::Context) {
-        log::info!("upstream relay started");
+        relay_log::info!("upstream relay started");
 
         self.auth_backoff.reset();
         self.outage_backoff.reset();
@@ -841,7 +838,7 @@ impl Actor for UpstreamRelay {
     }
 
     fn stopped(&mut self, _ctx: &mut Self::Context) {
-        log::info!("upstream relay stopped");
+        relay_log::info!("upstream relay stopped");
     }
 }
 
@@ -866,7 +863,7 @@ impl Handler<Authenticate> for UpstreamRelay {
     fn handle(&mut self, _msg: Authenticate, ctx: &mut Self::Context) -> Self::Result {
         // detect incorrect authentication requests, if we detect them we have a programming error
         if let Some(auth_state_error) = self.get_auth_state_error() {
-            log::error!("{}", auth_state_error);
+            relay_log::error!("{}", auth_state_error);
             return Box::new(fut::err(()));
         }
 
@@ -875,7 +872,7 @@ impl Handler<Authenticate> for UpstreamRelay {
             None => return Box::new(fut::err(())),
         };
 
-        log::info!(
+        relay_log::info!(
             "registering with upstream ({})",
             self.config.upstream_descriptor()
         );
@@ -893,14 +890,14 @@ impl Handler<Authenticate> for UpstreamRelay {
             .enqueue_query(request, ctx)
             .into_actor(self)
             .and_then(|challenge, slf, ctx| {
-                log::debug!("got register challenge (token = {})", challenge.token());
+                relay_log::debug!("got register challenge (token = {})", challenge.token());
                 let challenge_response = challenge.into_response();
 
-                log::debug!("sending register challenge response");
+                relay_log::debug!("sending register challenge response");
                 slf.enqueue_query(challenge_response, ctx).into_actor(slf)
             })
             .map(|_, slf, ctx| {
-                log::info!("relay successfully registered with upstream");
+                relay_log::info!("relay successfully registered with upstream");
                 slf.auth_state = AuthState::Registered;
                 slf.auth_backoff.reset();
 
@@ -912,7 +909,7 @@ impl Handler<Authenticate> for UpstreamRelay {
                 ctx.notify(PumpHttpMessageQueue);
             })
             .map_err(move |err, slf, ctx| {
-                log::error!("authentication encountered error: {}", LogError(&err));
+                relay_log::error!("authentication encountered error: {}", LogError(&err));
 
                 if err.is_permanent_rejection() {
                     slf.auth_state = AuthState::Denied;
@@ -927,7 +924,7 @@ impl Handler<Authenticate> for UpstreamRelay {
                 }
 
                 // Even on network errors, retry authentication independently.
-                log::debug!(
+                relay_log::debug!(
                     "scheduling authentication retry in {} seconds",
                     interval.as_secs()
                 );
@@ -953,6 +950,25 @@ impl Handler<IsAuthenticated> for UpstreamRelay {
 
     fn handle(&mut self, _msg: IsAuthenticated, _ctx: &mut Self::Context) -> Self::Result {
         self.auth_state.is_authenticated()
+    }
+}
+
+pub struct IsNetworkOutage;
+
+impl Message for IsNetworkOutage {
+    type Result = bool;
+}
+
+/// The `IsNetworkOutage` message is an internal Relay message that is used to
+/// query the current state of network connection with the upstream server.
+///
+/// Currently it is only used by the HealthCheck actor to emit the
+/// `upstream.network_outage` metric.
+impl Handler<IsNetworkOutage> for UpstreamRelay {
+    type Result = bool;
+
+    fn handle(&mut self, _msg: IsNetworkOutage, _ctx: &mut Self::Context) -> Self::Result {
+        self.is_network_outage()
     }
 }
 
@@ -1010,25 +1026,25 @@ impl Handler<CheckUpstreamConnection> for UpstreamRelay {
             UpstreamRequestConfig {
                 priority: RequestPriority::Immediate,
                 retry: false,
-                update_rate_limits: false,
+                intercept_status_errors: true,
                 set_relay_id: true,
             },
             Method::GET,
             "/api/0/relays/live/",
-            |builder: RequestBuilder| builder.finish().map_err(UpstreamRequestError::from),
+            |builder: RequestBuilder| builder.finish().map_err(UpstreamRequestError::Http),
             ctx,
         )
         .and_then(|client_response| {
             // consume response bodies to ensure the connection remains usable.
             client_response
                 .consume()
-                .map_err(UpstreamRequestError::from)
+                .map_err(UpstreamRequestError::Http)
         })
         .into_actor(self)
         .then(|result, slf, ctx| {
             if matches!(result, Err(err) if err.is_network_error()) {
                 // still network error, schedule another attempt
-                ctx.notify_later(CheckUpstreamConnection, slf.outage_backoff.next_backoff());
+                slf.upstream_connection_check(ctx);
             } else {
                 // resume normal messages
                 ctx.notify(PumpHttpMessageQueue);
@@ -1084,7 +1100,7 @@ struct UpstreamRequestConfig {
     /// Should the request be retried in case of network error.
     retry: bool,
     /// Should 429s be honored within the upstream.
-    update_rate_limits: bool,
+    intercept_status_errors: bool,
     /// Should the x-sentry-relay-id header be added.
     set_relay_id: bool,
 }
@@ -1099,7 +1115,7 @@ impl SendRequest {
             config: UpstreamRequestConfig {
                 priority: RequestPriority::Low,
                 retry: true,
-                update_rate_limits: true,
+                intercept_status_errors: true,
                 set_relay_id: true,
             },
         }
@@ -1135,8 +1151,8 @@ where
     }
 
     #[inline]
-    pub fn update_rate_limits(mut self, should_update_rate_limits: bool) -> Self {
-        self.config.update_rate_limits = should_update_rate_limits;
+    pub fn intercept_status_errors(mut self, should_intercept_status_errors: bool) -> Self {
+        self.config.intercept_status_errors = should_intercept_status_errors;
         self
     }
 

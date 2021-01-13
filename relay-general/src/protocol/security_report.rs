@@ -50,7 +50,14 @@ pub enum CspDirective {
     StyleSrcAttr,
     UpgradeInsecureRequests,
     WorkerSrc,
-    // Sandbox , // unsupported
+    Sandbox,
+    NavigateTo,
+    ReportUri,
+    ReportTo,
+    BlockAllMixedContent,
+    RequireSriFor,
+    RequireTrustedTypesFor,
+    TrustedTypes,
 }
 
 derive_fromstr_and_display!(CspDirective, InvalidSecurityError, {
@@ -77,6 +84,14 @@ derive_fromstr_and_display!(CspDirective, InvalidSecurityError, {
     CspDirective::StyleSrcAttr => "style-src-attr",
     CspDirective::UpgradeInsecureRequests => "upgrade-insecure-requests",
     CspDirective::WorkerSrc => "worker-src",
+    CspDirective::Sandbox => "sandbox",
+    CspDirective::NavigateTo => "navigate-to",
+    CspDirective::ReportUri => "report-uri",
+    CspDirective::ReportTo => "report-to",
+    CspDirective::BlockAllMixedContent => "block-all-mixed-content",
+    CspDirective::RequireSriFor => "require-sri-for",
+    CspDirective::RequireTrustedTypesFor => "require-trusted-types-for",
+    CspDirective::TrustedTypes => "trusted-types",
 });
 
 impl_str_serde!(CspDirective);
@@ -536,10 +551,14 @@ struct ExpectCtRaw {
     date_time: Option<DateTime<Utc>>,
     hostname: String,
     port: Option<i64>,
+    scheme: Option<String>,
+    #[serde(with = "serde_date_time_3339")]
     effective_expiration_date: Option<DateTime<Utc>>,
     served_certificate_chain: Option<Vec<String>>,
     validated_certificate_chain: Option<Vec<String>>,
     scts: Option<Vec<SingleCertificateTimestampRaw>>,
+    failure_mode: Option<String>,
+    test_report: Option<bool>,
 }
 
 mod serde_date_time_3339 {
@@ -600,6 +619,7 @@ impl ExpectCtRaw {
             date_time: Annotated::from(self.date_time.map(|d| d.to_rfc3339())),
             hostname: Annotated::from(self.hostname),
             port: Annotated::from(self.port),
+            scheme: Annotated::from(self.scheme),
             effective_expiration_date: Annotated::from(
                 self.effective_expiration_date.map(|d| d.to_rfc3339()),
             ),
@@ -619,6 +639,8 @@ impl ExpectCtRaw {
                     .map(|elm| Annotated::from(elm.into_protocol()))
                     .collect()
             })),
+            failure_mode: Annotated::from(self.failure_mode),
+            test_report: Annotated::from(self.test_report),
         }
     }
 
@@ -678,11 +700,14 @@ pub struct ExpectCt {
     /// The hostname to which the UA made the original request that failed the CT compliance check.
     pub hostname: Annotated<String>,
     pub port: Annotated<i64>,
+    pub scheme: Annotated<String>,
     /// Date time in rfc3339 format
     pub effective_expiration_date: Annotated<String>,
     pub served_certificate_chain: Annotated<Array<String>>,
     pub validated_certificate_chain: Annotated<Array<String>>,
     pub scts: Annotated<Array<SingleCertificateTimestamp>>,
+    pub failure_mode: Annotated<String>,
+    pub test_report: Annotated<bool>,
 }
 
 impl ExpectCt {
@@ -1590,6 +1615,7 @@ mod tests {
                 "date-time": "2014-04-06T13:00:50Z",
                 "hostname": "www.example.com",
                 "port": 443,
+                "scheme": "https",
                 "effective-expiration-date": "2014-05-01T12:40:50Z",
                 "served-certificate-chain": ["-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----"],
                 "validated-certificate-chain": ["-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----"],
@@ -1600,7 +1626,9 @@ mod tests {
                         "source": "embedded",
                         "serialized_sct": "ABCD=="
                     }
-                ]
+                ],
+                "failure-mode": "enforce",
+                "test-report": false
             }
         }"#;
 
@@ -1629,6 +1657,7 @@ mod tests {
             "date_time": "2014-04-06T13:00:50+00:00",
             "hostname": "www.example.com",
             "port": 443,
+            "scheme": "https",
             "effective_expiration_date": "2014-05-01T12:40:50+00:00",
             "served_certificate_chain": [
               "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----"
@@ -1643,7 +1672,9 @@ mod tests {
                 "source": "embedded",
                 "serialized_sct": "ABCD=="
               }
-            ]
+            ],
+            "failure_mode": "enforce",
+            "test_report": false
           }
         }
         "###);
