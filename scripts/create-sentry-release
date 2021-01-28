@@ -33,7 +33,7 @@ docker run --rm --entrypoint cat "${DOCKER_IMAGE}" /opt/relay-debug.zip > relay-
 docker run --rm --entrypoint cat "${DOCKER_IMAGE}" /opt/relay.src.zip > relay.src.zip
 
 echo 'Uploading debug information and source bundle...'
-sentry-cli upload-dif ./relay-debug.zip ./relay.src.zip
+sentry-cli --log-level=debug upload-dif ./relay-debug.zip ./relay.src.zip
 
 echo 'Creating a new deploy in Sentry...'
 sentry-cli releases new "${VERSION}"
